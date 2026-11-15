@@ -766,6 +766,78 @@ async function withFakeTimers(body) {
 	}
 }
 
+test('strict mode revalidates queued calls after timer drift without weights', async t => {
+	await withFakeTimers(async clock => {
+		const executions = [];
+		const throttled = pThrottle({limit: 1, interval: 100, strict: true})(() => {
+			executions.push(clock.now);
+		});
+		const promises = [throttled(), throttled(), throttled()];
+		clock.runNext(50);
+		while (clock.pendingTimerCount > 0) {
+			clock.runNext();
+		}
+
+		await Promise.all(promises);
+		t.deepEqual(executions, [1000, 1150, 1250]);
+		t.is(throttled.queueSize, 0);
+	});
+});
+
+test('strict mode limits overdue timers and new calls without weights', async t => {
+	await withFakeTimers(async clock => {
+		const executions = [];
+		const throttle = pThrottle({limit: 2, interval: 100, strict: true});
+		const record = () => executions.push({time: clock.now, weight: 1});
+		const first = throttle(record);
+		const second = throttle(record);
+		const promises = Array.from({length: 8}, () => first());
+		clock.runNext(250);
+		promises.push(second());
+		while (clock.pendingTimerCount > 0) {
+			clock.runNext();
+		}
+
+		await Promise.all(promises);
+		t.is(executions.length, 9);
+		assertWeightLimit(t, executions, 2, 100);
+		t.is(first.queueSize, 0);
+		t.is(second.queueSize, 0);
+	});
+});
+
+test('strict mode aborts a rescheduled call and resets capacity without weights', async t => {
+	await withFakeTimers(async clock => {
+		const controller = new AbortController();
+		let delayCount = 0;
+		const throttled = pThrottle({
+			limit: 1,
+			interval: 100,
+			strict: true,
+			signal: controller.signal,
+			onDelay() {
+				delayCount++;
+			},
+		})(() => clock.now);
+		const first = throttled();
+		const second = throttled();
+		const third = throttled();
+		clock.runNext(50);
+		clock.runNext();
+		t.is(throttled.queueSize, 1);
+		t.is(delayCount, 2);
+		const reason = new Error('Stop rescheduled call');
+		controller.abort(reason);
+
+		await Promise.all([first, second]);
+		await t.throwsAsync(third, {is: reason});
+		t.is(clock.pendingTimerCount, 0);
+		t.is(throttled.queueSize, 0);
+		t.is(await throttled(), clock.now);
+		t.is(delayCount, 2);
+	});
+});
+
 function assertWeightLimit(t, executions, limit, interval) {
 	for (const {time} of executions) {
 		let total = 0;

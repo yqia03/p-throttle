@@ -54,6 +54,7 @@ export default function pThrottle({limit, interval, strict, signal, onDelay, wei
 	const state = {
 		queue: new Map(),
 		strictTicks: [],
+		strictExecutedTicks: [],
 		// Track windowed algorithm state so it can be reset on abort
 		currentTick: 0,
 		activeWeight: 0,
@@ -211,6 +212,21 @@ export default function pThrottle({limit, interval, strict, signal, onDelay, wei
 				let tickRecord = strict ? delayResult.tickRecord : undefined;
 
 				const execute = () => {
+					if (strict && !weight) {
+						const now = Date.now();
+						while (state.strictExecutedTicks.length > 0 && now - state.strictExecutedTicks[0] >= interval) {
+							state.strictExecutedTicks.shift();
+						}
+
+						// Reservations can expire before delayed timers actually run. Check actual executions so overdue calls cannot exceed the limit.
+						if (state.strictExecutedTicks.length >= strictCapacity) {
+							schedule(state.strictExecutedTicks[0] + interval - now);
+							return;
+						}
+
+						state.strictExecutedTicks.push(now);
+					}
+
 					// Revalidate weighted calls at execution time to account for timer drift
 					if (tickRecord) {
 						const actualTime = Date.now();
@@ -226,9 +242,7 @@ export default function pThrottle({limit, interval, strict, signal, onDelay, wei
 							tickRecord = updatedDelayResult.tickRecord;
 
 							if (updatedDelayResult.delay > 0) {
-								state.queue.delete(timeoutId);
-								timeoutId = setTimeout(execute, updatedDelayResult.delay);
-								state.queue.set(timeoutId, reject);
+								schedule(updatedDelayResult.delay);
 								return;
 							}
 
@@ -247,12 +261,20 @@ export default function pThrottle({limit, interval, strict, signal, onDelay, wei
 					state.queue.delete(timeoutId);
 				};
 
-				if (delay > 0) {
-					timeoutId = setTimeout(execute, delay);
+				const schedule = milliseconds => {
+					const isFirstDelay = timeoutId === undefined;
+					state.queue.delete(timeoutId);
+					timeoutId = setTimeout(execute, milliseconds);
 					state.queue.set(timeoutId, reject);
-					try {
-						onDelay?.(...arguments_);
-					} catch {}
+					if (isFirstDelay) {
+						try {
+							onDelay?.(...arguments_);
+						} catch {}
+					}
+				};
+
+				if (delay > 0) {
+					schedule(delay);
 				} else {
 					execute();
 				}
@@ -288,6 +310,7 @@ export default function pThrottle({limit, interval, strict, signal, onDelay, wei
 
 						functionState.queue.clear();
 						functionState.strictTicks.length = 0;
+						functionState.strictExecutedTicks.length = 0;
 						// Reset windowed state so subsequent calls are not artificially delayed
 						functionState.currentTick = 0;
 						functionState.activeWeight = 0;
